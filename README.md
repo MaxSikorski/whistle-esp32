@@ -249,6 +249,14 @@ cmake -S host -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 `clip.wav` must be 16 kHz mono 16-bit. Add `-DCMAKE_C_FLAGS=-DND_PROFILE` to
 the first line for per-phase timings.
 
+The console's regression tests use the `rich` dependency installed above;
+they need no model, board or serial connection. Run them from the repository
+root:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
 ### Verifying the engine
 
 Whistle has no published source; the official engine is a prebuilt library.
