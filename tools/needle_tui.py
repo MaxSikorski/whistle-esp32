@@ -50,6 +50,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -402,11 +403,13 @@ class WhistleSession:
         self.prof = {}
         self.speech = {}
         self.lang = None
+        self.error = None
         self.history = []        # (transcript, action) of earlier turns
 
     def feed(self, line):
         if line.startswith("EVT ready"):
             self.model_info = line[len("EVT ready "):]
+            self.status, self.error = "ready", None
         elif line.startswith("EVT selftest"):
             self.status = "self-test"
         elif line.startswith("EVT recording"):
@@ -414,6 +417,7 @@ class WhistleSession:
                 self.history = ([(self.text, self.action)] + self.history)[:4]
             self.status, self.text, self.action = "recording", None, None
             self.time, self.prof, self.speech, self.lang = {}, {}, {}, None
+            self.error = None
         elif line.startswith("EVT released"):
             self.status = "transcribing"
         elif line.startswith("EVT speech"):
@@ -434,9 +438,12 @@ class WhistleSession:
             self.action = _kv(line[4:]) if "=" in line else {}
             if self.status != "nothing heard":
                 self.status = "done" if self.action else "no colour heard"
+        elif line.startswith("ERR "):
+            self.error = line[4:]
+            self.status, self.action = "error", None
         elif line.startswith("EVT  READY"):
-            if self.status == "self-test":
-                self.status = "ready"
+            if self.status in ("self-test", "error"):
+                self.status, self.error = "ready", None
 
 
 def render_whistle(sess, backend_name):
@@ -448,7 +455,7 @@ def render_whistle(sess, backend_name):
     )
     col = {"ready": "grey50", "self-test": "yellow", "recording": "bold white",
            "transcribing": "cyan", "done": "green", "nothing heard": "red",
-           "no colour heard": "yellow"}.get(sess.status, "grey50")
+           "no colour heard": "yellow", "error": "bold red"}.get(sess.status, "grey50")
     depth = _kv(sess.model_info).get("depth", "?")
     head = Text()
     head.append("  Whistle ", style="bold white")
@@ -460,6 +467,8 @@ def render_whistle(sess, backend_name):
     layout["head"].update(Panel(head, border_style="grey30"))
 
     blocks = []
+    if sess.error is not None:
+        blocks.append(Panel(Text(sess.error, style="red"), title="error", border_style="red"))
     hint = {"ready": "hold the button and speak  ·  \"flash the light blue\" · \"allume la lumière verte\"",
             "self-test": "boot self-test: transcribing a built-in clip...",
             "recording": "listening...  release the button when you are done",
@@ -530,17 +539,23 @@ def render_whistle(sess, backend_name):
 
 def whistle_main(args):
     sess = WhistleSession()
-    if args.serial:
-        backend = SerialBackend(args.serial, assert_dtr=False)
-        name, lines = backend.name, None
-    else:
-        cmd = [args.whistle_binary, args.whistle_model, args.local_wav, "--protocol",
-               "--gate", "12", "--lang", "auto", "--led-keywords"]
-        backend, name = None, "host " + args.local_wav.split("/")[-1]
-        lines = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 text=True).stdout
-    CONSOLE.clear()
+    backend = proc = errors = None
+    returncode = 0
     try:
+        if args.serial:
+            backend = SerialBackend(args.serial, assert_dtr=False)
+            name, lines = backend.name, None
+        else:
+            cmd = [args.whistle_binary, args.whistle_model, args.local_wav, "--protocol",
+                   "--gate", "12", "--lang", "auto", "--led-keywords"]
+            name = "host " + args.local_wav.split("/")[-1]
+            # The host also writes normal diagnostics to stderr. Keep them
+            # separate from protocol lines and show them only on failure.
+            # A file avoids filling a second pipe while we read stdout.
+            errors = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True)
+            lines = proc.stdout
+        CONSOLE.clear()
         with Live(render_whistle(sess, name), console=CONSOLE, refresh_per_second=8,
                   screen=False) as live:
             while True:
@@ -556,14 +571,36 @@ def whistle_main(args):
                         continue
                 sess.feed(line)
                 live.update(render_whistle(sess, name))
-            if lines is not None:
+            if proc is not None:
+                returncode = proc.wait()
+                if returncode:
+                    errors.seek(0)
+                    message = errors.read().strip() or f"host engine exited with status {returncode}"
+                    sess.feed("ERR " + message)
+                    returncode = max(1, returncode)  # signals also mean failure
                 live.update(render_whistle(sess, name))
+    except OSError as exc:
+        sess.feed("ERR " + str(exc))
+        CONSOLE.print(Panel(Text(sess.error, style="red"), title="error", border_style="red"))
+        returncode = 1
     except KeyboardInterrupt:
-        pass
+        returncode = 130
     finally:
         if backend:
             backend.close()
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            proc.stdout.close()
+        if errors is not None:
+            errors.close()
     CONSOLE.print("\n[grey50]bye[/]")
+    return returncode or int(sess.error is not None)
 
 
 def main():
